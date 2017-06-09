@@ -30,6 +30,7 @@ Instance::Instance(Manager* pManager, EffectNode* pEffectNode, InstanceContainer
 	, m_State(INSTANCE_STATE_ACTIVE)
 	, m_LivedTime(0)
 	, m_LivingTime(0)
+	, uvTimeOffset(0)
 	, m_stepTime(false)
 	, m_sequenceNumber(0)
 	, m_flexibleGeneratedChildrenCount(nullptr)
@@ -343,11 +344,96 @@ void Instance::Initialize( Instance* parent, int32_t instanceNumber )
 		scaling_values.fcruve.offset.z = m_pEffectNode->ScalingFCurve->Z.GetOffset( *m_pManager );
 	}
 
-	/* 生成位置 */
+	// Spawning Method
 	if( m_pEffectNode->GenerationLocation.type == ParameterGenerationLocation::TYPE_POINT )
 	{
 		vector3d p = m_pEffectNode->GenerationLocation.point.location.getValue( *m_pManager );
 		m_GenerationLocation.Translation( p.x, p.y, p.z );
+	}
+	else if (m_pEffectNode->GenerationLocation.type == ParameterGenerationLocation::TYPE_LINE)
+	{
+		vector3d s = m_pEffectNode->GenerationLocation.line.position_start.getValue(*m_pManager);
+		vector3d e = m_pEffectNode->GenerationLocation.line.position_end.getValue(*m_pManager);
+		auto noize = Max(1, m_pEffectNode->GenerationLocation.line.position_noize.getValue(*m_pManager));
+		auto division = m_pEffectNode->GenerationLocation.line.division;
+
+		Vector3D dir;
+		(e - s).setValueToArg(dir);
+
+		if (Vector3D::LengthSq(dir) < 0.001)
+		{
+			m_GenerationLocation.Translation(0 ,0, 0);
+		}
+		else
+		{
+			auto len = Vector3D::Length(dir);
+			dir /= len;
+		
+			int32_t target = 0;
+			if (m_pEffectNode->GenerationLocation.line.type == ParameterGenerationLocation::LineType::Order)
+			{
+				target = instanceNumber % division;
+			}
+			else if (m_pEffectNode->GenerationLocation.line.type == ParameterGenerationLocation::LineType::Random)
+			{
+				RandFunc randFunc = m_pManager->GetRandFunc();
+				int32_t randMax = m_pManager->GetRandMax();
+
+				target = (int32_t)((division) * ((float)randFunc() / (float)randMax));
+				if (target == division) division -= 1;
+			}
+
+			auto d = (len / (float)division) * target;
+			d += noize;
+		
+			s.x += dir.X * d;
+			s.y += dir.Y * d;
+			s.z += dir.Z * d;
+
+			Vector3D xdir;
+			Vector3D ydir;
+			Vector3D zdir;
+
+			if (std::abs(dir.Y) > 0.999f)
+			{
+				xdir = dir;
+				Vector3D::Cross(zdir, xdir, Vector3D(-1, 0, 0));
+				Vector3D::Normal(zdir, zdir);
+				Vector3D::Cross(ydir, zdir, xdir);
+				Vector3D::Normal(ydir, ydir);
+			}
+			else
+			{
+				xdir = dir;
+				Vector3D::Cross(ydir, Vector3D(0, 0, 1), xdir);
+				Vector3D::Normal(ydir, ydir);
+				Vector3D::Cross(zdir, xdir, ydir);
+				Vector3D::Normal(zdir, zdir);
+			}
+
+			if (m_pEffectNode->GenerationLocation.EffectsRotation)
+			{
+				m_GenerationLocation.Value[0][0] = xdir.X;
+				m_GenerationLocation.Value[0][1] = xdir.Y;
+				m_GenerationLocation.Value[0][2] = xdir.Z;
+
+				m_GenerationLocation.Value[1][0] = ydir.X;
+				m_GenerationLocation.Value[1][1] = ydir.Y;
+				m_GenerationLocation.Value[1][2] = ydir.Z;
+
+				m_GenerationLocation.Value[2][0] = zdir.X;
+				m_GenerationLocation.Value[2][1] = zdir.Y;
+				m_GenerationLocation.Value[2][2] = zdir.Z;
+			}
+			else
+			{
+				m_GenerationLocation.Indentity();
+			}
+
+			m_GenerationLocation.Value[3][0] = s.x;
+			m_GenerationLocation.Value[3][1] = s.y;
+			m_GenerationLocation.Value[3][2] = s.z;
+		}
 	}
 	else if( m_pEffectNode->GenerationLocation.type == ParameterGenerationLocation::TYPE_SPHERE )
 	{
@@ -456,16 +542,53 @@ void Instance::Initialize( Instance* parent, int32_t instanceNumber )
 		}
 
 		float angle = (end - start) * ((float)target / (float)div) + start;
-		Matrix43 mat;
-		mat.RotationZ( angle );
 
-		m_GenerationLocation.Translation( 0, radius, 0 );
+		angle += m_pEffectNode->GenerationLocation.circle.angle_noize.getValue(*m_pManager);
+
+		Matrix43 mat;
+		if (m_pEffectNode->GenerationLocation.circle.axisDirection == ParameterGenerationLocation::AxisType::X)
+		{
+			mat.RotationX(angle);
+			m_GenerationLocation.Translation(0, 0, radius);
+		}
+		if (m_pEffectNode->GenerationLocation.circle.axisDirection == ParameterGenerationLocation::AxisType::Y)
+		{
+			mat.RotationY(angle);
+			m_GenerationLocation.Translation(radius, 0, 0);
+		}
+		if (m_pEffectNode->GenerationLocation.circle.axisDirection == ParameterGenerationLocation::AxisType::Z)
+		{
+			mat.RotationZ(angle);
+			m_GenerationLocation.Translation(0, radius, 0);
+		}
+
+		
 		Matrix43::Multiple( m_GenerationLocation, m_GenerationLocation, mat );
 	}
 
 	if( m_pEffectNode->SoundType == ParameterSoundType_Use )
 	{
 		soundValues.delay = m_pEffectNode->Sound.Delay.getValue( *m_pManager );
+	}
+
+	// UV
+	if (m_pEffectNode->RendererCommon.UVType == ParameterRendererCommon::UV_ANIMATION)
+	{
+		uvTimeOffset = m_pEffectNode->RendererCommon.UV.Animation.StartFrame.getValue(*m_pManager);
+		uvTimeOffset *= m_pEffectNode->RendererCommon.UV.Animation.FrameLength;
+	}
+	
+	if (m_pEffectNode->RendererCommon.UVType == ParameterRendererCommon::UV_SCROLL)
+	{
+		auto xy = m_pEffectNode->RendererCommon.UV.Scroll.Position.getValue(*m_pManager);
+		auto zw = m_pEffectNode->RendererCommon.UV.Scroll.Size.getValue(*m_pManager);
+
+		uvScrollArea.X = xy.x;
+		uvScrollArea.Y = xy.y;
+		uvScrollArea.Width = zw.x;
+		uvScrollArea.Height = zw.y;
+
+		m_pEffectNode->RendererCommon.UV.Scroll.Speed.getValue(*m_pManager).setValueToArg(uvScrollSpeed);
 	}
 
 	m_pEffectNode->InitializeRenderedInstance(*this, m_pManager);
@@ -1182,7 +1305,9 @@ RectF Instance::GetUV() const
 	}
 	else if( m_pEffectNode->RendererCommon.UVType == ParameterRendererCommon::UV_ANIMATION )
 	{
-		int32_t frameNum = (int32_t)(m_LivingTime / m_pEffectNode->RendererCommon.UV.Animation.FrameLength);
+		auto time = m_LivingTime + uvTimeOffset;
+
+		int32_t frameNum = (int32_t)(time / m_pEffectNode->RendererCommon.UV.Animation.FrameLength);
 		int32_t frameCount = m_pEffectNode->RendererCommon.UV.Animation.FrameCountX * m_pEffectNode->RendererCommon.UV.Animation.FrameCountY;
 
 		if( m_pEffectNode->RendererCommon.UV.Animation.LoopType == m_pEffectNode->RendererCommon.UV.Animation.LOOPTYPE_ONCE )
@@ -1217,11 +1342,13 @@ RectF Instance::GetUV() const
 	}
 	else if( m_pEffectNode->RendererCommon.UVType == ParameterRendererCommon::UV_SCROLL )
 	{
+		auto time = m_LivingTime + uvTimeOffset;
+
 		return RectF(
-			m_pEffectNode->RendererCommon.UV.Scroll.Position.x + m_pEffectNode->RendererCommon.UV.Scroll.Speed.x * m_LivingTime,
-			m_pEffectNode->RendererCommon.UV.Scroll.Position.y + m_pEffectNode->RendererCommon.UV.Scroll.Speed.y * m_LivingTime,
-			m_pEffectNode->RendererCommon.UV.Scroll.Position.w,
-			m_pEffectNode->RendererCommon.UV.Scroll.Position.h );
+			uvScrollArea.X + uvScrollSpeed.X * time,
+			uvScrollArea.Y + uvScrollSpeed.Y * time,
+			uvScrollArea.Width,
+			uvScrollArea.Height);
 	}
 
 	return RectF( 0.0f, 0.0f, 1.0f, 1.0f );
